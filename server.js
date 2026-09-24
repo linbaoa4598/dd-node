@@ -21,14 +21,12 @@ function kdf(key, path) {
   return crypto.createHmac('sha256', hmacKey).update(key).digest();
 }
 
-// 每个连接从请求体派生独立的密钥和 IV，响应方向再派生一次。
-function derive(body) {
-  const key = crypto.createHash('md5').update(uuidBytes).update(body).digest();
-  const iv = crypto.createHash('md5').update(body).update(uuidBytes).digest();
+// 每个连接的请求里带了随机的 key 和 IV，响应方向用它们的 SHA256 前 16 字节。
+function derive(bodyKey, bodyIV) {
   return {
-    key, iv,
-    respKey: crypto.createHash('md5').update(key).digest(),
-    respIv: crypto.createHash('md5').update(iv).digest(),
+    key: bodyKey, iv: bodyIV,
+    respKey: crypto.createHash('sha256').update(bodyKey).digest().subarray(0, 16),
+    respIv: crypto.createHash('sha256').update(bodyIV).digest().subarray(0, 16),
   };
 }
 
@@ -61,14 +59,19 @@ function makeStreamDecoder(session, onData) {
   return (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     for (;;) {
-      if (expect === null) {
-        if (buf.length < 18) return;
-        const len = gcmDecrypt(lenKey, chunkNonce(session.iv, count), buf.subarray(0, 18));
-        expect = len.readUInt16BE(0);
-        buf = buf.subarray(18);
-      }
+        if (expect === null) {
+          if (buf.length < 18) return;
+          let len;
+          try { len = gcmDecrypt(lenKey, chunkNonce(session.iv, count), buf.subarray(0, 18)); }
+          catch (e) { return 'end'; }
+          expect = len.readUInt16BE(0);
+          buf = buf.subarray(18);
+        }
       if (buf.length < expect + 16) return;
-      onData(gcmDecrypt(session.key, chunkNonce(session.iv, count), buf.subarray(0, expect + 16)));
+      let payload;
+      try { payload = gcmDecrypt(session.key, chunkNonce(session.iv, count), buf.subarray(0, expect + 16)); }
+      catch (e) { return 'end'; }
+      onData(payload);
       buf = buf.subarray(expect + 16);
       expect = null;
       count++;
@@ -126,8 +129,8 @@ function crc32(buf) {
 function parseHeader(buf) {
   let o = 0;
   o++;                                        // 版本
-  o += 16;                                    // IV
-  o += 16;                                    // key
+  const bodyIV = buf.subarray(o, o + 16); o += 16;
+  const bodyKey = buf.subarray(o, o + 16); o += 16;
   const v = buf[o++];                         // 响应认证字节
   const opt = buf[o++];
   const pad = opt >> 4;
@@ -143,7 +146,7 @@ function parseHeader(buf) {
   else return null;
   o += pad;
   o++;                                        // 校验字节
-  return { v, sec, cmd, host, port, rest: buf.subarray(o) };
+  return { v, sec, cmd, host, port, key: bodyKey, iv: bodyIV, rest: buf.subarray(o) };
 }
 
 const server = http.createServer((req, res) => {
@@ -163,12 +166,14 @@ wss.on('connection', (ws) => {
   const send = (data) => { if (ws.readyState === ws.OPEN) ws.send(data); };
   let respCount = 0;
 
+  const chunks = [];
   const start = (header) => {
     if (header.cmd !== 1 || header.sec !== 3) { ws.close(); return; }
     upstream = net.connect(header.port, header.host);
     upstream.on('connect', () => {
-      // 先回一个认证字节，告诉客户端握手成功。
       send(gcmEncrypt(session.respKey, session.respIv, Buffer.from([header.v])));
+      for (const c of chunks) upstream.write(c);
+      chunks.length = 0;
       if (header.rest.length) upstream.write(header.rest);
     });
     upstream.on('data', (data) => send(encodeChunk(session, data, respCount++)));
@@ -176,26 +181,29 @@ wss.on('connection', (ws) => {
     upstream.on('close', () => ws.close());
   };
 
+  let rawBuf = Buffer.alloc(0);
   ws.on('message', (data) => {
     try {
+      rawBuf = Buffer.concat([rawBuf, Buffer.from(data)]);
       if (!session) {
-        // 第一个消息携带请求头：authid、加密长度、随机数、加密头部，后面紧跟数据块。
-        const raw = Buffer.from(data);
-        const opened = openHeader(raw);
-        if (!opened) { ws.close(); return; }
+        const opened = openHeader(rawBuf);
+        if (!opened) return;                       // 头部还没到齐
         const header = parseHeader(opened.header);
         if (!header) { ws.close(); return; }
-        session = derive(opened.header.subarray(0, 16));
+        session = derive(header.key, header.iv);
         decode = makeStreamDecoder(session, (payload) => {
           if (upstream && upstream.writable) upstream.write(payload);
+          else chunks.push(payload);
         });
         start(header);
-        if (raw.length > opened.consumed) decode(raw.subarray(opened.consumed));
-        return;
+        rawBuf = rawBuf.subarray(opened.consumed);
       }
-      const result = decode(Buffer.from(data));
-      if (result === 'end') ws.close();
-    } catch {
+      if (session && rawBuf.length) {
+        const result = decode(rawBuf);
+        rawBuf = Buffer.alloc(0);
+        if (result === 'end') ws.close();
+      }
+    } catch (e) {
       ws.close();
     }
   });
