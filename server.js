@@ -177,7 +177,7 @@ wss.on('connection', (ws) => {
       if (header.rest.length) upstream.write(header.rest);
     });
     upstream.on('data', (data) => send(encodeChunk(session, data, respCount++)));
-    upstream.on('error', () => ws.close());
+    upstream.on('error', (e) => { console.error('upstream error:', e.message); ws.close(); });
     upstream.on('close', () => ws.close());
   };
 
